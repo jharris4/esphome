@@ -1,6 +1,9 @@
 #include "ld2420.h"
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
+#ifdef USE_ESP32
+#include <rom/ets_sys.h>
+#endif
 
 /*
 Configure commands - little endian
@@ -218,6 +221,26 @@ void LD2420Component::dump_config() {
 }
 
 void LD2420Component::setup() {
+  // Per the LD2420 protocol: the module streams waveform data by default.
+  // After a software restart the LD2420 stays powered and keeps streaming.
+  // The datasheet prescribes sending "open command mode" once (response will
+  // be mixed with waveform data), waiting ~100ms, flushing, then sending it
+  // again for a clean response.
+  // Send the command frame directly to avoid the retry loop in send_cmd_from_array
+  // which would waste up to 3 seconds parsing garbled responses.
+  // Use ets_delay_us (ROM busy-wait) rather than delay() or delay_microseconds_safe()
+  // as neither esp_timer nor FreeRTOS ticks are reliable this early after a soft reset.
+  static constexpr uint8_t OPEN_CMD[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF,
+                                         0x00, 0x02, 0x00, 0x04, 0x03, 0x02, 0x01};
+  this->write_array(OPEN_CMD, sizeof(OPEN_CMD));
+#ifdef USE_ESP32
+  ets_delay_us(100000);  // 100ms busy-wait: safe before esp_timer/FreeRTOS are ready
+#else
+  delay(100);  // NOLINT
+#endif
+  while (this->available())
+    this->read();
+
   if (this->set_config_mode(true) == LD2420_ERROR_TIMEOUT) {
     ESP_LOGE(TAG, ESP_LOG_MSG_COMM_FAIL);
     this->mark_failed();
@@ -674,7 +697,11 @@ int LD2420Component::send_cmd_from_array(CmdFrameT frame) {
       while (this->available()) {
         this->readline_(this->read(), ack_buffer, sizeof(ack_buffer));
       }
+#ifdef USE_ESP32
+      ets_delay_us(1450);  // ROM-level busy-wait: no esp_timer or FreeRTOS dependency, safe during early boot
+#else
       delay_microseconds_safe(1450);
+#endif
       // Wait on an Rx from the LD2420 for up to 3 1 second loops, otherwise it could trigger a WDT.
       if ((millis() - start_millis) > 1000) {
         start_millis = millis();
